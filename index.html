@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Palette-Cycling Slime</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #000;
+      }
+      body {
+        font:
+          14px system-ui,
+          sans-serif;
+        color: #d7e6d7;
+      }
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        image-rendering: pixelated;
+        cursor: crosshair;
+      }
+      .panel {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 2;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px 14px;
+        max-width: calc(100vw - 24px);
+        padding: 10px 12px;
+        background: rgb(0 0 0 / 78%);
+        border: 1px solid #254325;
+        border-radius: 8px;
+        backdrop-filter: blur(4px);
+      }
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        white-space: nowrap;
+      }
+      input[type="range"] {
+        width: 100px;
+        accent-color: #39d353;
+      }
+      button {
+        color: #e8f5e8;
+        background: #142414;
+        border: 1px solid #396339;
+        border-radius: 5px;
+        padding: 5px 9px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #203b20;
+      }
+      .hint {
+        opacity: 0.75;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="screen" aria-label="Palette cycling drawing canvas"></canvas>
+    <div class="panel">
+      <label
+        >Cycle speed
+        <input id="speed" type="range" min="1" max="120" value="28" /><span
+          id="speedValue"
+          >28</span
+        ></label
+      >
+      <label
+        >Ring spacing
+        <input id="spacing" type="range" min="2" max="16" value="6" /><span
+          id="spacingValue"
+          >6</span
+        ></label
+      >
+      <label
+        >Radius
+        <input id="radius" type="range" min="10" max="100" value="42" /><span
+          id="radiusValue"
+          >42</span
+        ></label
+      >
+      <button id="clear">Clear</button>
+      <button id="pause">Pause</button>
+      <span class="hint"
+        >Click or drag to draw · Space to pause · C to clear</span
+      >
+    </div>
+    <script>
+      (() => {
+        "use strict";
+
+        const canvas = document.querySelector("#screen");
+        const ctx = canvas.getContext("2d", { alpha: false });
+        const speedInput = document.querySelector("#speed");
+        const spacingInput = document.querySelector("#spacing");
+        const radiusInput = document.querySelector("#radius");
+        const speedValue = document.querySelector("#speedValue");
+        const spacingValue = document.querySelector("#spacingValue");
+        const radiusValue = document.querySelector("#radiusValue");
+        const pauseButton = document.querySelector("#pause");
+
+        // Simulate at a reduced resolution, then scale to the browser window.
+        // Each simulation pixel stores only a palette index (0..255).
+        const SCALE = 2;
+        let width = 0,
+          height = 0;
+        let field = new Uint8Array(0);
+        let image = null;
+        let rgba = null;
+        let palette = new Uint8Array(256 * 4);
+        let paletteOffset = 0;
+        let paused = false;
+        let drawing = false;
+        let lastPoint = null;
+        let lastFrameTime = 0;
+        let elapsed = 0;
+
+        // A smooth, cyclic black -> green -> bright green -> black palette.
+        // The first and last colours match, so the cycle has no visible seam.
+        function makePalette() {
+          for (let i = 0; i < 256; i++) {
+            const phase = (i / 256) * Math.PI * 2;
+            // Keep red and blue at zero; green follows a smooth wave from black to bright.
+            const green = Math.round(
+              255 *
+                Math.pow(
+                  Math.max(0, (Math.sin(phase - Math.PI / 2) + 1) / 2),
+                  2.2,
+                ),
+            );
+            const p = i * 4;
+            palette[p] = 0;
+            palette[p + 1] = green;
+            palette[p + 2] = 0;
+            palette[p + 3] = 255;
+          }
+        }
+
+        function resize() {
+          const dpr = Math.max(1, window.devicePixelRatio || 1);
+          canvas.width = Math.round(window.innerWidth * dpr);
+          canvas.height = Math.round(window.innerHeight * dpr);
+          // CSS dimensions remain viewport-sized; draw the low-res image scaled to the full canvas.
+          width = Math.max(1, Math.ceil(canvas.width / (SCALE * dpr)));
+          height = Math.max(1, Math.ceil(canvas.height / (SCALE * dpr)));
+          field = new Uint8Array(width * height);
+          // for (var x = 0; x < width * height; x++) {
+          //   field[x] = Math.random() * 32;
+          // }
+          image = new ImageData(width, height);
+          rgba = image.data;
+          bufferCanvas.width = width;
+          bufferCanvas.height = height;
+          ctx.imageSmoothingEnabled = true;
+          lastPoint = null;
+          render();
+        }
+
+        function screenToField(event) {
+          const rect = canvas.getBoundingClientRect();
+          return {
+            x: Math.max(
+              0,
+              Math.min(
+                width - 1,
+                Math.floor(((event.clientX - rect.left) / rect.width) * width),
+              ),
+            ),
+            y: Math.max(
+              0,
+              Math.min(
+                height - 1,
+                Math.floor(((event.clientY - rect.top) / rect.height) * height),
+              ),
+            ),
+          };
+        }
+
+        // paint circle brush
+        function paintCircle(cx, cy, r) {
+          const r2 = Math.pow(r, 2);
+          for (var x = -r; x < r; x++)
+            for (var y = -r; y < r; y++) {
+              const dist2 = Math.pow(x, 2) + Math.pow(y, 2);
+              if (dist2 < r2) {
+                const d = Math.round(r - Math.sqrt(dist2));
+                const i = (cy + y) * width + (cx + x);
+                field[i] = (field[i] + d) & 255;
+              }
+            }
+        }
+
+        function drawInterpolated(from, to) {
+          const dx = to.x - from.x,
+            dy = to.y - from.y;
+          const distance = Math.hypot(dx, dy);
+          // Space stamps closely enough to avoid gaps during fast pointer movement.
+          const step = Math.max(1, Number(spacingInput.value) / 2);
+          const count = Math.max(1, Math.ceil(distance / step));
+          for (let n = 1; n <= count; n++) {
+            const t = n / count;
+            paintCircle(
+              Math.round(from.x + dx * t),
+              Math.round(from.y + dy * t),
+              Number(radiusInput.value),
+            );
+          }
+        }
+
+        function render() {
+          // Palette cycling changes only the displayed RGBA image, never `field`.
+          const offset = paletteOffset;
+          for (let i = 0, p = 0; i < field.length; i++, p += 4) {
+            const c = ((field[i] + Math.floor(offset)) & 255) * 4;
+            rgba[p] = palette[c];
+            rgba[p + 1] = palette[c + 1];
+            rgba[p + 2] = palette[c + 2];
+            rgba[p + 3] = 255;
+          }
+          ctx.putImageData(image, 0, 0);
+          // Scale the simulation buffer to the display canvas.
+          ctx.drawImage(canvas, 0, 0); // replaced below by offscreen rendering
+        }
+
+        // Use a separate low-resolution canvas so scaling doesn't feed back into itself.
+        const bufferCanvas = document.createElement("canvas");
+        const bufferCtx = bufferCanvas.getContext("2d", { alpha: false });
+
+        function render() {
+          const offset = paletteOffset;
+          for (let i = 0, p = 0; i < field.length; i++, p += 4) {
+            const c = ((field[i] + Math.floor(offset)) & 255) * 4;
+            rgba[p] = palette[c];
+            rgba[p + 1] = palette[c + 1];
+            rgba[p + 2] = palette[c + 2];
+            rgba[p + 3] = 255;
+          }
+          bufferCtx.putImageData(image, 0, 0);
+          ctx.imageSmoothingEnabled = true;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(bufferCanvas, 0, 0, canvas.width, canvas.height);
+        }
+
+        function animate(now) {
+          if (!lastFrameTime) lastFrameTime = now;
+          const dt = Math.min(100, now - lastFrameTime);
+          lastFrameTime = now;
+          if (!paused) {
+            elapsed += dt;
+            // Speed is palette-index steps per second, independent of frame rate.
+            paletteOffset =
+              (paletteOffset + (Number(speedInput.value) * dt) / 1000) % 256;
+            render();
+          }
+          requestAnimationFrame(animate);
+        }
+
+        canvas.addEventListener("pointerdown", (event) => {
+          if (event.button !== 0) return;
+          drawing = true;
+          canvas.setPointerCapture(event.pointerId);
+          lastPoint = screenToField(event);
+          paintCircle(lastPoint.x, lastPoint.y, Number(radiusInput.value));
+          render();
+          event.preventDefault();
+        });
+
+        canvas.addEventListener("pointermove", (event) => {
+          if (!drawing || !lastPoint) return;
+          const point = screenToField(event);
+          drawInterpolated(lastPoint, point);
+          lastPoint = point;
+          render();
+        });
+
+        function stopDrawing() {
+          drawing = false;
+          lastPoint = null;
+        }
+        canvas.addEventListener("pointerup", stopDrawing);
+        canvas.addEventListener("pointercancel", stopDrawing);
+        canvas.addEventListener("lostpointercapture", stopDrawing);
+
+        function clear() {
+          field.fill(0);
+          paletteOffset = 0;
+          render();
+        }
+        document.querySelector("#clear").addEventListener("click", clear);
+        pauseButton.addEventListener("click", () => {
+          paused = !paused;
+          pauseButton.textContent = paused ? "Resume" : "Pause";
+        });
+
+        speedInput.addEventListener(
+          "input",
+          () => (speedValue.textContent = speedInput.value),
+        );
+        spacingInput.addEventListener(
+          "input",
+          () => (spacingValue.textContent = spacingInput.value),
+        );
+        radiusInput.addEventListener(
+          "input",
+          () => (radiusValue.textContent = radiusInput.value),
+        );
+        window.addEventListener("keydown", (event) => {
+          if (event.code === "Space" && event.target.tagName !== "INPUT") {
+            event.preventDefault();
+            paused = !paused;
+            pauseButton.textContent = paused ? "Resume" : "Pause";
+          } else if (
+            event.key.toLowerCase() === "c" &&
+            event.target.tagName !== "INPUT"
+          ) {
+            clear();
+          }
+        });
+        window.addEventListener("resize", resize);
+
+        makePalette();
+        resize();
+        requestAnimationFrame(animate);
+      })();
+    </script>
+  </body>
+</html>
